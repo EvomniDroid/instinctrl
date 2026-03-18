@@ -239,11 +239,12 @@ class OnPolicyRunner:
                     # 建议 1：只在第一步的时候打断点，防止死循环卡住！
                     if i == 0:
                         # import pdb; pdb.set_trace()
-                        print("4.2: 开始第 1 步收集数据！(建议在这里按 's' 进入 rollout_step，这步后面是奖励)")
-                        print("这步后面是奖励")
+                        # print("4.2: 开始第 1 步收集数据！(建议在这里按 's' 进入 rollout_step，这步后面是奖励)")
+                        # print("这步后面是奖励")
+                        print(" ")
    
                     # => 调用内部函数 rollout_step：模型产生动作，送到环境中。取得下一次各种返回值。
-                    print("在这后面进的奖励")
+                    # print("在这后面进的奖励")
                     obs, critic_obs, rewards, dones, infos = self.rollout_step(obs, critic_obs)
                     # 每步都刷新地形类型列表，保证统计用的是最新分配
                     self.terrain_type_list = get_env_terrain_types()
@@ -349,20 +350,20 @@ class OnPolicyRunner:
         """
         # 1. 算法层面：让 Actor 根据当前 obs 选出动作（在 PPO 中往往是高斯采样出 action，并同步记录 log_prob）
         actions = self.alg.act(obs, critic_obs)
-        print("在4.2.0")
+        # print("在4.2.0")
         # 2. 物理世界层面：把 actions 全下发给环境。环境运算一步物理学状态，并且把各类收益/新观察返回来。
         obs, rewards, dones, infos = self.env.step(actions) #更新了！！！！！！！
-        print("在4.2.1")
+        # print("在4.2.1")
         # 针对 Actor 和 Critic 输入的观察分离（Asymmetric Actor-Critic 架构常用技巧），拆出对应的特权观察值
         critic_obs = infos["observations"].get("critic", None) #从infos字典里面掏出来的
-        print("在4.2.2")
+        # print("在4.2.2")
         obs, critic_obs, rewards, dones = (
             obs.to(self.device),
             critic_obs.to(self.device) if critic_obs is not None else None,
             rewards.to(self.device),
             dones.to(self.device),
         )
-        print("在4.2.3")
+        # print("在4.2.3")
         # 3. 规整化 (Normalization) 层面：使用滑动平均对当前的观测结果做归一化，增强训练稳定性。
         for obs_group_name, normalizer in self.normalizers.items():
             if obs_group_name == "policy":
