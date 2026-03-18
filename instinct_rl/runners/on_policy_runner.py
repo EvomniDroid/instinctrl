@@ -138,6 +138,23 @@ class OnPolicyRunner:
         """
         print("开始学习") #加注释
         
+        # 地形统计结构
+        self.terrain_stats = {}
+        # 地形类型列表（每个env一个），直接引用环境的分配
+        def get_env_terrain_types():
+            env = self.env
+            # 递归查找底层环境的 terrain_type_list
+            for _ in range(5):  # 最多递归5层
+                if hasattr(env, "terrain_type_list") and env.terrain_type_list is not None:
+                    return env.terrain_type_list
+                if hasattr(env, "env"):
+                    env = env.env
+                elif hasattr(env, "unwrapped"):
+                    env = env.unwrapped
+                else:
+                    break
+            return ["unknown"] * getattr(self.env, "num_envs", 16)
+
         # 针对多卡分布式（DDP）训练的情况。如果在并行的非0 rank 上，初始化模型多卡同步。
         if dist.is_initialized():
             self.alg.distributed_data_parallel()
@@ -171,6 +188,8 @@ class OnPolicyRunner:
         cur_reward_sum = torch.zeros(self.env.num_envs, self.env.num_rewards, dtype=torch.float, device=self.device)
         cur_episode_length = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
         
+        # 初始化地形类型（假设reset后env有terrain_type_list属性）
+        self.terrain_type_list = get_env_terrain_types()
 
         print(
             "[INFO{}]: Initialization done, start learning.".format(
@@ -206,6 +225,16 @@ class OnPolicyRunner:
             with torch.inference_mode(self.cfg.get("inference_mode_rollout", True)):
                 # 执行指定的 num_steps_per_env 步与环境做交互来装满内存 Buffer
                 for i in range(self.num_steps_per_env):
+                    # print(f"[DEBUG][STEP] self.env type: {type(self.env)}")
+                    # print(f"[DEBUG][STEP] self.env.terrain_type_list(before): {getattr(self.env, 'terrain_type_list', None)}")
+                    # 如果 terrain_type_list 丢失，强制重新分配
+                    if not hasattr(self.env, 'terrain_type_list') or self.env.terrain_type_list is None:
+                        patch_cfgs = getattr(getattr(self.env, 'terrain', None), 'terrain_generator', None)
+                        if patch_cfgs and hasattr(patch_cfgs, 'subterrain_specific_cfgs'):
+                            patch_cfgs_list = patch_cfgs.subterrain_specific_cfgs
+                            num_envs = getattr(self.env, 'num_envs', len(patch_cfgs_list))
+                            self.env.terrain_type_list = [getattr(patch_cfgs_list[i % len(patch_cfgs_list)], 'name', 'unknown') for i in range(num_envs)]
+                            # print(f"[DEBUG][STEP] 强制分配 terrain_type_list: {self.env.terrain_type_list}")
                     
                     # 建议 1：只在第一步的时候打断点，防止死循环卡住！
                     if i == 0:
@@ -216,6 +245,9 @@ class OnPolicyRunner:
                     # => 调用内部函数 rollout_step：模型产生动作，送到环境中。取得下一次各种返回值。
                     print("在这后面进的奖励")
                     obs, critic_obs, rewards, dones, infos = self.rollout_step(obs, critic_obs)
+                    # 每步都刷新地形类型列表，保证统计用的是最新分配
+                    self.terrain_type_list = get_env_terrain_types()
+                    # print(f"[DEBUG][STEP] self.env.terrain_type_list(after): {getattr(self.env, 'terrain_type_list', None)}")
 
                     
                     if i == 0:
@@ -248,6 +280,20 @@ class OnPolicyRunner:
                         cur_reward_sum[new_ids] = 0
                         cur_episode_length[new_ids] = 0
 
+                        # 地形摔倒统计
+                        terrain_types = get_env_terrain_types()
+                        # print(f"[DEBUG][STAT] terrain_types: {terrain_types}")
+                        for idx in new_ids:
+                            terrain = terrain_types[idx]
+                            # print(f"[DEBUG][STAT] env_id={idx}, terrain_name={terrain}")
+                            if terrain not in self.terrain_stats:
+                                self.terrain_stats[terrain] = {"total": 0, "fall": 0}
+                            self.terrain_stats[terrain]["total"] += 1
+                            # 摔倒判据：reward小于0（可根据实际情况调整）
+                            # 多reward时只看第一个reward
+                            if rewards[idx][0].item() < 0:
+                                self.terrain_stats[terrain]["fall"] += 1
+
                 stop = time.time()
                 collection_time = stop - start  # 统计收集数据这一个阶段的耗时
                 
@@ -275,6 +321,11 @@ class OnPolicyRunner:
             # 以一定的迭代频率将各类 log (损失、标量、FPS表现等) 刷出并写进 Tensorboard
             if self.log_dir is not None and self.current_learning_iteration % self.log_interval == 0:
                 self.log(locals())
+                # 输出地形摔倒统计
+                print("地形摔倒统计：")
+                for terrain, stat in self.terrain_stats.items():
+                    rate = stat["fall"] / stat["total"] if stat["total"] > 0 else 0
+                    print(f"地形 {terrain}: 摔倒 {stat['fall']}/{stat['total']}，摔倒率 {rate*100:.1f}%")
                 
             # 到达指定间隔则存储一次网络神经权重到磁盘 (.pt)
             if (
