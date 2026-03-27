@@ -138,8 +138,9 @@ class OnPolicyRunner:
         """
         print("开始学习") #加注释
         
-        # 地形统计结构
-        self.terrain_stats = {}
+        # 地形统计结构 - 使用滑动窗口，只统计最近20轮
+        self.terrain_stats_window = 20
+        self.terrain_stats_history = []  # 存储每轮的统计
         # 地形类型列表（每个env一个），直接引用环境的分配
         def get_env_terrain_types():
             env = self.env
@@ -187,6 +188,7 @@ class OnPolicyRunner:
         lenbuffer = deque(maxlen=100)   #记录最近 100 次机器人**“存活了多少步”*
         cur_reward_sum = torch.zeros(self.env.num_envs, self.env.num_rewards, dtype=torch.float, device=self.device)
         cur_episode_length = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
+        self._rollout_terrain_stats = {}  # 本轮地形统计
         
         # 初始化地形类型（假设reset后env有terrain_type_list属性）
         self.terrain_type_list = get_env_terrain_types()
@@ -252,7 +254,8 @@ class OnPolicyRunner:
 
                     
                     if i == 0:
-                        print("rollout结束")
+                        print(" ")
+                        # print("rollout结束")
                         
                     # 对奖励升维处理，应对单维或是多目标奖励配置
                     if len(rewards.shape) == 1:
@@ -281,25 +284,28 @@ class OnPolicyRunner:
                         cur_reward_sum[new_ids] = 0
                         cur_episode_length[new_ids] = 0
 
-                        # 地形摔倒统计
+                        # 地形摔倒统计 - 每轮收集时用局部变量记录
                         terrain_types = get_env_terrain_types()
-                        # print(f"[DEBUG][STAT] terrain_types: {terrain_types}")
                         for idx in new_ids:
                             terrain = terrain_types[idx]
-                            # print(f"[DEBUG][STAT] env_id={idx}, terrain_name={terrain}")
-                            if terrain not in self.terrain_stats:
-                                self.terrain_stats[terrain] = {"total": 0, "fall": 0}
-                            self.terrain_stats[terrain]["total"] += 1
-                            # 摔倒判据：reward小于0（可根据实际情况调整）
-                            # 多reward时只看第一个reward
+                            if terrain not in self._rollout_terrain_stats:
+                                self._rollout_terrain_stats[terrain] = {"total": 0, "fall": 0}
+                            self._rollout_terrain_stats[terrain]["total"] += 1
                             if rewards[idx][0].item() < 0:
-                                self.terrain_stats[terrain]["fall"] += 1
+                                self._rollout_terrain_stats[terrain]["fall"] += 1
 
                 stop = time.time()
                 collection_time = stop - start  # 统计收集数据这一个阶段的耗时
                 
+                # 将本轮统计追加到历史记录（滑动窗口）
+                self.terrain_stats_history.append(self._rollout_terrain_stats)
+                if len(self.terrain_stats_history) > self.terrain_stats_window:
+                    self.terrain_stats_history.pop(0)
+                # 重置本轮统计
+                self._rollout_terrain_stats = {}
+                
                 # import pdb; pdb.set_trace()
-                print("4.3: 数据收集完毕，准备计算优势函数(GAE)！")                             
+                # print("4.3: 数据收集完毕，准备计算优势函数(GAE)！")                             
                 
                 # --- 阶段 B：Learning step 优势计算 ---
                 start = stop
@@ -308,7 +314,7 @@ class OnPolicyRunner:
                 self.alg.compute_returns(critic_obs if critic_obs is not None else obs)
             
             # import pdb; pdb.set_trace()
-            print("4.4: 优势函数计算完毕，准备进行 PPO 神经网络更新！(按 's' 进去看Loss)")
+            # print("4.4: 优势函数计算完毕，准备进行 PPO 神经网络更新！(按 's' 进去看Loss)")
             
             # --- 阶段 C：Learning step 反向传播更新 ---
             # 缩进已经退出了 inference_mode，梯度引擎开启。
@@ -322,11 +328,18 @@ class OnPolicyRunner:
             # 以一定的迭代频率将各类 log (损失、标量、FPS表现等) 刷出并写进 Tensorboard
             if self.log_dir is not None and self.current_learning_iteration % self.log_interval == 0:
                 self.log(locals())
-                # 输出地形摔倒统计
-                print("地形摔倒统计：")
-                for terrain, stat in self.terrain_stats.items():
+                # 输出地形摔倒统计（最近20轮滑动窗口）
+                terrain_stats_window = {}
+                for round_stats in self.terrain_stats_history:
+                    for terrain, stat in round_stats.items():
+                        if terrain not in terrain_stats_window:
+                            terrain_stats_window[terrain] = {"total": 0, "fall": 0}
+                        terrain_stats_window[terrain]["total"] += stat["total"]
+                        terrain_stats_window[terrain]["fall"] += stat["fall"]
+                print(f"地形摔倒统计（最近{len(self.terrain_stats_history)}轮）：")
+                for terrain, stat in terrain_stats_window.items():
                     rate = stat["fall"] / stat["total"] if stat["total"] > 0 else 0
-                    print(f"地形 {terrain}: 摔倒 {stat['fall']}/{stat['total']}，摔倒率 {rate*100:.1f}%")
+                    print(f"  地形 {terrain}: 摔倒 {stat['fall']}/{stat['total']}，摔倒率 {rate*100:.1f}%")
                 
             # 到达指定间隔则存储一次网络神经权重到磁盘 (.pt)
             if (
@@ -374,7 +387,7 @@ class OnPolicyRunner:
                 infos["observations"]["critic"] = critic_obs
             else:
                 infos["observations"][obs_group_name] = normalizer(infos["observations"][obs_group_name])
-        print("在4.2.4")                
+        # print("在4.2.4")                
         # 4. 数据留存层面：将上面发生的所有历史事件 (动作、价值、奖励、是否done、正常化后的观测) 统统推入 PPO 内存库(Storage) 中备用。
         self.alg.process_env_step(rewards, dones, infos, obs, critic_obs)
         return obs, critic_obs, rewards, dones, infos
@@ -589,7 +602,7 @@ class OnPolicyRunner:
         if self.is_mp_rank_other_process():
             return
 
-        loaded_dict = torch.load(path, weights_only=True)
+        loaded_dict = torch.load(path, weights_only=False)
         if self.cfg.get("ckpt_manipulator", False):
             # suppose to be a string specifying which function to use
             print("\033[1;36m Warning: using a hacky way to load the model. \033[0m")
