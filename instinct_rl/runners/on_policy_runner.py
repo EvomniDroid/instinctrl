@@ -139,7 +139,7 @@ class OnPolicyRunner:
         print("开始学习") #加注释
         
         # 地形统计结构 - 使用滑动窗口，只统计最近20轮
-        self.terrain_stats_window = 20
+        self.terrain_stats_window = 100
         self.terrain_stats_history = []  # 存储每轮的统计
         # 地形类型列表（每个env一个），直接引用环境的分配
         def get_env_terrain_types():
