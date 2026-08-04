@@ -138,15 +138,22 @@ class OnPolicyRunner:
         """
         print("开始学习") #加注释
         
-        # 地形统计结构 - 使用滑动窗口，只统计最近20轮
+        # 地形统计结构 - 使用滑动窗口，只统计最近100轮
         self.terrain_stats_window = 100
         self.terrain_stats_history = []  # 存储每轮的统计
         # 地形类型列表（每个env一个），直接引用环境的分配
+        TERRAIN_TYPES = [
+            "perlin_rough", "perlin_rough_stand", "square_gaps", "pyramid_stairs", "pyramid_stairs_high",
+            "pyramid_stairs_inv", "pyramid_stairs_inv_high", "boxes", "mesh_boxes", "hf_pyramid_slope_inv",
+            "raised_mound", "pit_crater", "wave", "circle_track"
+        ]
+        TERRAIN_NUM_ROWS = 10
+        TERRAIN_NUM_COLS = 20
         def get_env_terrain_types():
             env = self.env
             # 递归查找底层环境的 terrain_type_list
             for _ in range(5):  # 最多递归5层
-                if hasattr(env, "terrain_type_list") and env.terrain_type_list is not None:
+                if hasattr(env, "terrain_type_list") and env.terrain_type_list is not None and len(env.terrain_type_list) > 0 and env.terrain_type_list[0] != "unknown":
                     return env.terrain_type_list
                 if hasattr(env, "env"):
                     env = env.env
@@ -154,7 +161,15 @@ class OnPolicyRunner:
                     env = env.unwrapped
                 else:
                     break
-            return ["unknown"] * getattr(self.env, "num_envs", 16)
+            # 使用正确的 terrain_idx 计算公式
+            num_envs = getattr(self.env, "num_envs", 16)
+            result = []
+            for i in range(num_envs):
+                row = i // TERRAIN_NUM_COLS
+                col = i % TERRAIN_NUM_COLS
+                terrain_idx = (row * TERRAIN_NUM_COLS + col) % len(TERRAIN_TYPES)
+                result.append(TERRAIN_TYPES[terrain_idx])
+            return result
 
         # 针对多卡分布式（DDP）训练的情况。如果在并行的非0 rank 上，初始化模型多卡同步。
         if dist.is_initialized():
@@ -186,6 +201,12 @@ class OnPolicyRunner:
         rframebuffer = [deque(maxlen=2000) for _ in range(self.env.num_rewards)]  #记录最近 2000 个单步/单帧的瞬间奖励分布
         rewbuffer = [deque(maxlen=100) for _ in range(self.env.num_rewards)]#记录最近 100 次完整回合 (Episode) 结束时的总累计奖励。
         lenbuffer = deque(maxlen=100)   #记录最近 100 次机器人**“存活了多少步”*
+        cmd_vx_err_buffer = deque(maxlen=4000)
+        cmd_vy_err_buffer = deque(maxlen=4000)
+        cmd_wz_err_buffer = deque(maxlen=4000)
+        zero_command_drift_buffer = deque(maxlen=4000)
+        vx_mean_buffer = deque(maxlen=4000)
+        stand_ratio_buffer = deque(maxlen=1000)
         cur_reward_sum = torch.zeros(self.env.num_envs, self.env.num_rewards, dtype=torch.float, device=self.device)
         cur_episode_length = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
         self._rollout_terrain_stats = {}  # 本轮地形统计
@@ -211,6 +232,7 @@ class OnPolicyRunner:
         start_iter = self.current_learning_iteration
         tot_iter = self.current_learning_iteration + num_learning_iterations #当前轮加上我自己轮
         tot_start_time = time.time()
+        tot_iter_start = time.time()
         start = time.time()
         
         # import pdb; pdb.set_trace()
@@ -221,6 +243,8 @@ class OnPolicyRunner:
         # 强化学习最核心的交替循环：(阶段A)收集数据 -> (阶段B)更新网络 -> 循环
         # ---------------------------------------------
         while self.current_learning_iteration < tot_iter:
+
+            tot_iter_start = time.time()
             
             # --- 阶段 A：Rollout (探索与数据收集) ---
             # 使用 torch.inference_mode 关闭梯度求导以节约显存和算力
@@ -271,6 +295,35 @@ class OnPolicyRunner:
                         # 累加各个并行环境的 reward 及运行长度
                         cur_reward_sum += rewards
                         cur_episode_length += 1
+
+                        # Headless quick diagnostics for quadruped locomotion quality.
+                        try:
+                            base_cmd = self.env.unwrapped.command_manager.get_command("base_velocity")
+                            robot = self.env.unwrapped.scene["robot"]
+                            cmd_vx = base_cmd[:, 0]
+                            cmd_vy = base_cmd[:, 1]
+                            cmd_wz = base_cmd[:, 2]
+                            act_vx = robot.data.root_lin_vel_b[:, 0]
+                            act_vy = robot.data.root_lin_vel_b[:, 1]
+                            act_wz = robot.data.root_ang_vel_b[:, 2]
+
+                            cmd_vx_err_buffer.extend(torch.abs(cmd_vx - act_vx).detach().cpu().tolist())
+                            cmd_vy_err_buffer.extend(torch.abs(cmd_vy - act_vy).detach().cpu().tolist())
+                            cmd_wz_err_buffer.extend(torch.abs(cmd_wz - act_wz).detach().cpu().tolist())
+                            vx_mean_buffer.extend(act_vx.detach().cpu().tolist())
+
+                            zero_command_mask = (torch.norm(base_cmd[:, :2], dim=-1) < 0.05) & (torch.abs(cmd_wz) < 0.05)
+                            if torch.any(zero_command_mask):
+                                zero_command_drift_buffer.extend(
+                                    torch.norm(robot.data.root_lin_vel_b[zero_command_mask, :2], dim=-1).detach().cpu().tolist()
+                                )
+
+                            moving_mask = (torch.abs(cmd_vx) > 0.05) | (torch.abs(cmd_vy) > 0.05) | (torch.abs(cmd_wz) > 0.05)
+                            if torch.any(moving_mask):
+                                stand_mask = (torch.abs(act_vx) < 0.08) & (torch.abs(act_wz) < 0.12)
+                                stand_ratio_buffer.append(stand_mask[moving_mask].float().mean().item())
+                        except Exception:
+                            pass
                         
                         # 挑选出在本帧发生了 Done（成功结束或触发惩罚终止/截断）的环境 id
                         new_ids = (dones > 0).nonzero(as_tuple=False)[:, 0]
@@ -286,12 +339,19 @@ class OnPolicyRunner:
 
                         # 地形摔倒统计 - 每轮收集时用局部变量记录
                         terrain_types = get_env_terrain_types()
+                        time_outs = infos.get("time_outs", None)
                         for idx in new_ids:
                             terrain = terrain_types[idx]
                             if terrain not in self._rollout_terrain_stats:
                                 self._rollout_terrain_stats[terrain] = {"total": 0, "fall": 0}
                             self._rollout_terrain_stats[terrain]["total"] += 1
-                            if rewards[idx][0].item() < 0:
+                            # Count falls by termination reason, not by reward sign.
+                            # Falls are non-timeout terminations (e.g. bad orientation, illegal contact, low height).
+                            if time_outs is not None:
+                                is_fall = bool(dones[idx].item() > 0 and (not bool(time_outs[idx].item())))
+                            else:
+                                is_fall = bool(dones[idx].item() > 0)
+                            if is_fall:
                                 self._rollout_terrain_stats[terrain]["fall"] += 1
 
                 stop = time.time()
@@ -324,6 +384,21 @@ class OnPolicyRunner:
             
             stop = time.time()
             learn_time = stop - start # 记录网络模型训练花费的时间
+
+            total_time = time.time() - tot_start_time
+            iteration_time = stop - tot_iter_start
+            remaining_time = total_time / (self.current_learning_iteration + 1 - start_iter) * (
+                tot_iter - self.current_learning_iteration - 1
+            )
+
+            if not self.is_mp_rank_other_process():
+                print(
+                    f"[ITER {self.current_learning_iteration+1}/{tot_iter}]  "
+                    f"本轮: {iteration_time:.1f}s  "
+                    f"累计: {total_time:.1f}s ({total_time/3600:.1f}h)  "
+                    f"预计剩余: {remaining_time:.1f}s ({remaining_time/3600:.1f}h)  "
+                    f"总步数: {self.tot_timesteps}"
+                )
             
             # 以一定的迭代频率将各类 log (损失、标量、FPS表现等) 刷出并写进 Tensorboard
             if self.log_dir is not None and self.current_learning_iteration % self.log_interval == 0:
@@ -337,9 +412,43 @@ class OnPolicyRunner:
                         terrain_stats_window[terrain]["total"] += stat["total"]
                         terrain_stats_window[terrain]["fall"] += stat["fall"]
                 print(f"地形摔倒统计（最近{len(self.terrain_stats_history)}轮）：")
+                total_all = 0
+                fall_all = 0
                 for terrain, stat in terrain_stats_window.items():
                     rate = stat["fall"] / stat["total"] if stat["total"] > 0 else 0
                     print(f"  地形 {terrain}: 摔倒 {stat['fall']}/{stat['total']}，摔倒率 {rate*100:.1f}%")
+                    total_all += stat["total"]
+                    fall_all += stat["fall"]
+                    if self.writer is not None and (not self.is_mp_rank_other_process()):
+                        self.writer.add_scalar(
+                            f"Terrain/fall_rate/{terrain}", rate, self.current_learning_iteration
+                        )
+                        self.writer.add_scalar(
+                            f"Terrain/episodes/{terrain}", stat["total"], self.current_learning_iteration
+                        )
+                if total_all > 0 and self.writer is not None and (not self.is_mp_rank_other_process()):
+                    mean_fall_rate = fall_all / total_all
+                    self.writer.add_scalar(
+                        "Terrain/fall_rate_mean", mean_fall_rate, self.current_learning_iteration
+                    )
+                    self.writer.add_scalar(
+                            "00-Core/a_fall_rate_mean", mean_fall_rate, self.current_learning_iteration
+                    )
+
+                    stand_ratio_mean = statistics.mean(stand_ratio_buffer) if len(stand_ratio_buffer) > 0 else 1.0
+                    cmd_vx_err_mean = statistics.mean(cmd_vx_err_buffer) if len(cmd_vx_err_buffer) > 0 else 1.0
+                    vx_mean_mean = statistics.mean(vx_mean_buffer) if len(vx_mean_buffer) > 0 else 0.0
+
+                    survival_only = 1.0 if (mean_fall_rate < 0.12 and stand_ratio_mean > 0.55) else 0.0
+                    truly_learned = 1.0 if (mean_fall_rate < 0.12 and cmd_vx_err_mean < 0.20 and vx_mean_mean > 0.25) else 0.0
+
+                    # Keep these two indicators adjacent in TensorBoard.
+                    self.writer.add_scalar(
+                            "00-Core/a_walk_status_1_survival_only", survival_only, self.current_learning_iteration
+                    )
+                    self.writer.add_scalar(
+                            "00-Core/b_walk_status_2_truly_learned", truly_learned, self.current_learning_iteration
+                    )
                 
             # 到达指定间隔则存储一次网络神经权重到磁盘 (.pt)
             if (
@@ -472,6 +581,21 @@ class OnPolicyRunner:
             v = self.gather_stat_values(v, "mean")
             self.writer_mp_add_scalar("Train/" + k, v.item(), self.current_learning_iteration)
 
+        # Keep a minimal first-section panel in TensorBoard for one-glance diagnosis.
+        core_metrics = {}
+        for k, v in locs["losses"].items():
+            if k == "total_loss":
+                core_metrics["00-Core/e_loss_total_loss"] = float(v.item())
+            elif k == "value_loss":
+                core_metrics["00-Core/e_loss_value_loss"] = float(v.item())
+            elif k == "surrogate_loss":
+                core_metrics["00-Core/e_loss_surrogate_loss"] = float(v.item())
+        for k, v in locs["stats"].items():
+            if k == "grad_norm":
+                core_metrics["00-Core/d_grad_norm"] = float(v.item())
+        core_metrics["00-Core/f_action_std"] = float(mean_std.item())
+        core_metrics["00-Core/f_lr"] = float(self.alg.learning_rate)
+
         self.writer_mp_add_scalar("Loss/learning_rate", self.alg.learning_rate, self.current_learning_iteration)
         self.writer_mp_add_scalar("Policy/mean_noise_std", mean_std.item(), self.current_learning_iteration)
         self.writer_mp_add_scalar("Perf/total_fps", fps, self.current_learning_iteration)
@@ -494,7 +618,24 @@ class OnPolicyRunner:
                 statistics.mean(locs["rframebuffer"][i]),
                 self.current_learning_iteration,
             )
+
+        if len(locs.get("cmd_vx_err_buffer", [])) > 0:
+            core_metrics["00-Core/a_walk_cmd_vx_err"] = float(statistics.mean(locs["cmd_vx_err_buffer"]))
+            core_metrics["Velocity/vx_error"] = float(statistics.mean(locs["cmd_vx_err_buffer"]))
+        if len(locs.get("cmd_vy_err_buffer", [])) > 0:
+            core_metrics["Velocity/vy_error"] = float(statistics.mean(locs["cmd_vy_err_buffer"]))
+        if len(locs.get("zero_command_drift_buffer", [])) > 0:
+            core_metrics["Velocity/zero_command_drift"] = float(statistics.mean(locs["zero_command_drift_buffer"]))
+        if len(locs.get("vx_mean_buffer", [])) > 0:
+            core_metrics["00-Core/a_walk_vx_mean"] = float(statistics.mean(locs["vx_mean_buffer"]))
+        if len(locs.get("stand_ratio_buffer", [])) > 0:
+            core_metrics["00-Core/a_walk_stand_ratio"] = float(statistics.mean(locs["stand_ratio_buffer"]))
+
         if len(locs["rewbuffer"][0]) > 0:
+            core_metrics["00-Core/c_mean_reward"] = float(
+                statistics.mean([statistics.mean(buf) for buf in locs["rewbuffer"]])
+            )
+            core_metrics["00-Core/c_mean_episode_length"] = float(statistics.mean(locs["lenbuffer"]))
             for i in range(self.env.num_rewards):
                 self.writer_mp_add_scalar(
                     f"Train/mean_reward_{i}", statistics.mean(locs["rewbuffer"][i]), self.current_learning_iteration
@@ -524,6 +665,15 @@ class OnPolicyRunner:
             self.writer_mp_add_scalar(
                 "Train/time/mean_episode_length", statistics.mean(locs["lenbuffer"]), self.tot_time
             )
+            self.writer_mp_add_scalar(
+                "Key/mean_reward", statistics.mean([statistics.mean(buf) for buf in locs["rewbuffer"]]), self.current_learning_iteration
+            )
+            self.writer_mp_add_scalar(
+                "Key/mean_episode_length", statistics.mean(locs["lenbuffer"]), self.current_learning_iteration
+            )
+
+        for key, value in core_metrics.items():
+            self.writer_mp_add_scalar(key, value, self.current_learning_iteration)
 
         info_str = f" \033[1m Learning iteration {self.current_learning_iteration}/{locs['tot_iter']} \033[0m "
 

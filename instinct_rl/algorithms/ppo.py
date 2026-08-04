@@ -149,7 +149,7 @@ class PPO:
         return self.transition.actions
 
     def process_env_step(self, rewards, dones, infos, next_obs, next_critic_obs):
-        self.transition.rewards = rewards.clone()
+        self.transition.rewards = torch.nan_to_num(rewards.clone(), nan=0.0, posinf=100.0, neginf=-100.0)
 
         auxiliary_rewards = self.compute_auxiliary_reward(infos["observations"])
         # Add auxiliary rewards to the transition
@@ -159,7 +159,7 @@ class PPO:
             )  # This coef is per-auxiliary wise, will apply to all the rewards (if multiple rewards from the environment)
             if coef != 0.0:
                 # (num_envs, num_rewards) = scalar * (num_envs, num_rewards) * (1, num_rewards)
-                self.transition.rewards += coef * v * self.auxiliary_reward_per_env_reward_coefs
+                self.transition.rewards += coef * torch.nan_to_num(v, nan=0.0, posinf=100.0, neginf=-100.0) * self.auxiliary_reward_per_env_reward_coefs
             # Add the auxiliary rewards to info
             infos["step"][k] = v
 
@@ -198,6 +198,12 @@ class PPO:
             loss = 0.0
             for k, v in losses.items():
                 loss += getattr(self, k + "_coef", 1.0) * v
+
+            if not isinstance(loss, torch.Tensor) or not loss.requires_grad or torch.isnan(loss) or torch.isinf(loss):
+                print("[WARNING] Loss has no grad / NaN / Inf, skipping gradient step.")
+                continue
+
+            for k, v in losses.items():
                 mean_losses[k] = mean_losses[k] + v.detach()
             mean_losses["total_loss"] = mean_losses["total_loss"] + loss.detach()
             for k, v in stats.items():
@@ -218,6 +224,15 @@ class PPO:
         return mean_losses, average_stats
 
     def compute_losses(self, minibatch):
+        if torch.isnan(minibatch.obs).any() or torch.isinf(minibatch.obs).any():
+            print("[WARNING] NaN/Inf detected in policy observations, skipping update.")
+            return {
+                "surrogate_loss": torch.tensor(0.0, device=self.device),
+                "value_loss": torch.tensor(0.0, device=self.device),
+            }, torch.tensor(0.0, device=self.device), {
+                "value_loss": torch.tensor(0.0, device=self.device),
+            }
+
         actor_hidden_states = minibatch.hidden_states.actor if self.actor_critic.is_recurrent else None
         self.actor_critic.act(minibatch.obs, masks=minibatch.masks, hidden_states=actor_hidden_states)
         actions_log_prob_batch = self.actor_critic.get_actions_log_prob(minibatch.actions)
@@ -227,6 +242,24 @@ class PPO:
         )
         mu_batch = self.actor_critic.action_mean
         sigma_batch = self.actor_critic.action_std
+
+        if torch.isnan(value_batch).any() or torch.isinf(value_batch).any():
+            nan_mask = torch.isnan(value_batch) | torch.isinf(value_batch)
+            value_batch = torch.where(nan_mask, torch.zeros_like(value_batch), value_batch)
+            print("[WARNING] NaN/Inf in value_batch replaced with zeros to allow recovery.")
+        if torch.isnan(mu_batch).any() or torch.isinf(mu_batch).any():
+            nan_mask = torch.isnan(mu_batch) | torch.isinf(mu_batch)
+            mu_batch = torch.where(nan_mask, torch.zeros_like(mu_batch), mu_batch)
+            print("[WARNING] NaN/Inf in mu_batch replaced with zeros to allow recovery.")
+        if torch.isnan(actions_log_prob_batch).any() or torch.isinf(actions_log_prob_batch).any():
+            print("[WARNING] NaN/Inf in log_prob, skipping update.")
+            return {
+                "surrogate_loss": torch.tensor(0.0, device=self.device),
+                "value_loss": torch.tensor(0.0, device=self.device),
+            }, torch.tensor(0.0, device=self.device), {
+                "value_loss": torch.tensor(0.0, device=self.device),
+            }
+
         try:
             entropy_batch = self.actor_critic.entropy
         except:

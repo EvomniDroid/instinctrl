@@ -159,12 +159,17 @@ class RolloutStorage:
                 next_values = self.values[step + 1]
             next_is_not_terminal = 1.0 - self.dones[step].float()
             delta = self.rewards[step] + next_is_not_terminal * gamma * next_values - self.values[step]
+            delta = torch.clamp(delta, -100.0, 100.0)
             advantage = delta + next_is_not_terminal * gamma * lam * advantage
+            advantage = torch.clamp(advantage, -1000.0, 1000.0)
             self.returns[step] = advantage + self.values[step]
+
+        self.returns = torch.clamp(self.returns, -1000.0, 1000.0)
 
         # Compute and normalize the advantages
         self.advantages = self.returns - self.values
         self.advantages = (self.advantages - self.advantages.mean()) / (self.advantages.std() + 1e-8)
+        self.advantages = torch.clamp(self.advantages, -10.0, 10.0)
 
     def get_statistics(self):
         done = self.dones
